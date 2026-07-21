@@ -7,6 +7,7 @@ if _ROOT not in sys.path:
 
 import hashlib  # noqa: E402
 import io as _io  # noqa: E402
+import json  # noqa: E402
 import time  # noqa: E402
 
 import numpy as np  # noqa: E402
@@ -77,6 +78,10 @@ init_corpus_db()
 
 # FAISS index file path
 _INDEX_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "corpus.index"))
+
+# Branding config persistence
+_BRANDING_CONFIG_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "branding_config.json"))
+_BRANDING_LOGO_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "branding_logo.png"))
 
 # Initialize database
 init_db()
@@ -210,6 +215,75 @@ with st.sidebar:
         index=0,
         help="Filter the analysis dashboard and similarity matrices by a specific class section."
     )
+
+    # ── Report Branding (Admin only) ───────────────────────────────────────
+    if user_role == "admin":
+        st.markdown("---")
+        with st.expander("🎨 Report Branding", expanded=False):
+            st.caption("Customize PDF report appearance with your institution branding.")
+
+            def _load_branding_config() -> dict:
+                defaults = {"brand_color": "#1e3a8a", "logo_path": None}
+                try:
+                    if os.path.exists(_BRANDING_CONFIG_PATH):
+                        with open(_BRANDING_CONFIG_PATH, "r") as f:
+                            cfg = json.load(f)
+                        defaults.update(cfg)
+                except (json.JSONDecodeError, OSError):
+                    pass
+                return defaults
+
+            def _save_branding_config(cfg: dict) -> None:
+                with open(_BRANDING_CONFIG_PATH, "w") as f:
+                    json.dump(cfg, f, indent=2)
+
+            _branding_cfg = _load_branding_config()
+
+            brand_color = st.color_picker(
+                "Brand Color",
+                value=_branding_cfg.get("brand_color", "#1e3a8a"),
+                help="Applied to all PDF headers and section titles.",
+            )
+
+            logo_file = st.file_uploader(
+                "Institution Logo",
+                type=["png", "jpg", "jpeg"],
+                help="Logo appears in the PDF report header. Recommended: transparent PNG, max 300px wide.",
+            )
+
+            if logo_file is not None:
+                try:
+                    from PIL import Image as _PILImage
+                    import io as _img_io
+
+                    _img_bytes = logo_file.read()
+                    _img = _PILImage.open(_img_io.BytesIO(_img_bytes))
+                    max_w = 300
+                    if _img.width > max_w:
+                        ratio = max_w / _img.width
+                        _img = _img.resize((max_w, int(_img.height * ratio)), _PILImage.LANCZOS)
+                    buf = _img_io.BytesIO()
+                    _img.save(buf, format="PNG")
+                    logo_bytes = buf.getvalue()
+                    st.image(logo_bytes, width=150, caption="Logo preview")
+                    with open(_BRANDING_LOGO_PATH, "wb") as f:
+                        f.write(logo_bytes)
+                except Exception:
+                    logo_bytes = logo_file.getvalue()
+                    st.image(logo_bytes, width=150, caption="Logo preview")
+                    with open(_BRANDING_LOGO_PATH, "wb") as f:
+                        f.write(logo_bytes)
+                _branding_cfg["logo_path"] = _BRANDING_LOGO_PATH
+            elif os.path.exists(_BRANDING_LOGO_PATH):
+                _branding_cfg["logo_path"] = _BRANDING_LOGO_PATH
+            else:
+                _branding_cfg["logo_path"] = None
+
+            _branding_cfg["brand_color"] = brand_color
+            _save_branding_config(_branding_cfg)
+
+            st.session_state["brand_color"] = brand_color
+            st.session_state["logo_path"] = _branding_cfg.get("logo_path")
 
     st.markdown("---")
     st.markdown("""
@@ -997,6 +1071,15 @@ else:
     with tab_drill:
         st.subheader("🔬 Pair Drill-Down")
         st.caption("Inspect chunk-level similarity between any two documents.")
+
+        if "expand_all_drill" not in st.session_state:
+            st.session_state.expand_all_drill = False
+        expand_all_drill = st.toggle(
+            "Expand All",
+            value=st.session_state.expand_all_drill,
+            key="toggle_expand_all_drill",
+        )
+        st.session_state.expand_all_drill = expand_all_drill
         if n_docs < 2:
             st.warning("Need at least 2 documents.")
         else:
@@ -1037,7 +1120,10 @@ else:
                 if top_pairs:
                     st.subheader("🔑 Top Suspicious Paragraph Pairs")
                     for rank, (ca, cb, sim) in enumerate(top_pairs, 1):
-                        with st.expander(f"#{rank} — Similarity: {sim:.1%}", expanded=(rank == 1)):
+                        with st.expander(
+                            f"#{rank} — {doc_a} ↔ {doc_b} — {sim:.1%}",
+                            expanded=st.session_state.expand_all_drill or (rank == 1),
+                        ):
                             col1, col2 = st.columns(2)
                             with col1:
                                 st.markdown(f"**From {doc_a}**")
@@ -1053,13 +1139,20 @@ else:
                     if st.button("📥 Generate PDF Report", type="primary", use_container_width=True, key="pdf_report"):
                         with st.spinner("Generating PDF report..."):
                             try:
+                                _logo_bytes = None
+                                _logo_path = st.session_state.get("logo_path")
+                                if _logo_path and os.path.exists(_logo_path):
+                                    with open(_logo_path, "rb") as _lf:
+                                        _logo_bytes = _lf.read()
                                 pdf_buffer = generate_plagiarism_report(
                                     doc_a=doc_a,
                                     doc_b=doc_b,
                                     overall_similarity=score,
                                     threshold=threshold,
                                     top_pairs=top_pairs,
-                                    report_title="Plagiarism Detection Report"
+                                    report_title="Plagiarism Detection Report",
+                                    logo_image=_logo_bytes,
+                                    brand_color=st.session_state.get("brand_color"),
                                 )
                                 st.download_button(
                                     label="⬇️ Download PDF Report",
@@ -1073,7 +1166,10 @@ else:
                 else:
                     st.success("No paragraph pairs above the threshold for this pair.")
 
-            with st.expander("📄 View Raw Extracted Text"):
+            with st.expander(
+                "📄 View Raw Extracted Text",
+                expanded=st.session_state.expand_all_drill,
+            ):
                 t1, t2 = st.columns(2)
                 with t1:
                     st.markdown(f"**{doc_a}**")
